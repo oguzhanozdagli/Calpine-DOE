@@ -1,0 +1,175 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+def create_datetime_and_time_sec_column(edr_data):
+    """
+    Creates DateTime and Time (sec) columns.
+
+    Parameter:
+    edr_data (DataFrame): Pandas DataFrame containing the original EDR data.
+
+    Returns:
+    DataFrame: DataFrame with DateTime and Time (sec) columns added.
+    """
+    edr_data = edr_data.copy()
+    if 'Time (sec)' not in edr_data.columns:
+        loc_datetime = edr_data.columns.get_loc('HH:MM:SS') + 1
+        edr_data.insert(loc_datetime, 'Date time',
+            pd.to_datetime(edr_data['YYYY/MM/DD'] + ' ' + edr_data['HH:MM:SS'])
+        )
+        loc_time_sec = edr_data.columns.get_loc('Date time') + 1
+        time_difference = edr_data['Date time'] - edr_data['Date time'].iloc[0]
+        edr_data.insert(loc_time_sec, 'Time (sec)', time_difference.dt.total_seconds())
+    
+    return edr_data.reset_index(drop=True)
+
+def identify_drilling_periods(edr_data):
+    """
+    Identifies the periods when the drill bit is in contact with the rock and performing drilling, and detects drilling start times.
+
+    Parameter:
+    edr_data (DataFrame): Pandas DataFrame containing the original EDR data. Must include columns such as WOB, RPM, ROP, Bit Depth, and Hole Depth.
+
+    Returns:
+    DataFrame: DataFrame containing the start times of drilling and the periods when drilling was performed.
+    """
+    edr_data = edr_data.copy()
+    # Identify rows where drilling occurs
+    drilling_mask = (
+        (edr_data['Rate Of Penetration (ft_per_hr)'] > 0)
+    )
+
+    # Detect drilling start times
+    edr_data['Drilling Start'] = (~drilling_mask.shift(1, fill_value=False) & drilling_mask).astype(int)
+
+    # Identify the first drilling starts and ignore the first 90 seconds
+    edr_data['ignore'] = False
+    start_indices = edr_data[edr_data['Drilling Start'] == 1].index
+
+    for start_idx in start_indices:
+        end_idx = start_idx + 90  # Determine the 90-second period from the start of drilling
+        edr_data.loc[start_idx:end_idx, 'ignore'] = True
+
+    # Remove the 90-second periods
+    filtered_data = edr_data[edr_data['ignore'] == False].reset_index(drop=True)
+    
+    return filtered_data
+
+def calculate_rop_derivative(filtered_data):
+    """
+    Calculates ROP derivatives using np.gradient and assigns color categories based on thresholds.
+
+    Parameter:
+    filtered_data (DataFrame): Pandas DataFrame containing the periods when drilling was performed.
+
+    Returns:
+    DataFrame: DataFrame with ROP derivatives and color categories added.
+    """
+    filtered_data = filtered_data.copy()  # Make a copy to avoid changing the original data
+    filtered_data['ROP Derivative'] = np.nan  # Create an empty column
+    
+    # Calculate ROP derivative using np.gradient in a vectorized manner
+    rop_values = filtered_data['Rate Of Penetration (ft_per_hr)'].values
+    time_values = filtered_data['Time (sec)'].values
+    if len(rop_values) > 1:
+        rop_derivative = np.gradient(rop_values, time_values)
+        filtered_data['ROP Derivative'] = rop_derivative
+    
+    # Determine color categories based on thresholds
+    conditions = [
+        (filtered_data['ROP Derivative'] > 4) & (filtered_data['ROP Derivative'] < 5) & ((filtered_data['Weight on Bit (klbs)'] - filtered_data['AutoDriller WOB SP (klbs)']).abs() > 3),
+        (filtered_data['ROP Derivative'] > 3.5) & (filtered_data['ROP Derivative'] <= 4.5),
+        (filtered_data['ROP Derivative'] > 3.0) & (filtered_data['ROP Derivative'] <= 3.5),
+        (filtered_data['ROP Derivative'] > 2.5) & (filtered_data['ROP Derivative'] <= 3.0)
+    ]
+    colors = ['Red', 'Orange', 'Yellow', 'Green']
+    filtered_data['ROP Derivative Color'] = np.select(conditions, colors, default='Unknown')
+    
+    # Maintain sorting by time columns
+    filtered_data = filtered_data.sort_values(by=['YYYY/MM/DD', 'HH:MM:SS']).reset_index(drop=True)
+    
+    return filtered_data
+
+def generate_color_summary_table(filtered_data):
+    """
+    Generates a summary table containing color categories, excluding the 'Unknown' category.
+
+    Parameter:
+    filtered_data (DataFrame): Pandas DataFrame containing ROP derivatives and color categories.
+
+    Returns:
+    DataFrame: Summary table of color categories.
+    """
+    color_summary = filtered_data[filtered_data['ROP Derivative Color'] != 'Unknown']
+    color_summary = color_summary[['YYYY/MM/DD', 'HH:MM:SS', 'ROP Derivative Color', 'Hole Depth (feet)', 'WOB Difference (klbs)', 'ROP Set Point']]
+    return color_summary.reset_index(drop=True)
+
+def calculate_wob_difference(filtered_data):
+    """
+    Calculates the difference between the actual Weight on Bit (WOB) and the AutoDriller WOB Set Point (SP) for drilling periods only.
+
+    Parameter:
+    filtered_data (DataFrame): Pandas DataFrame containing the periods when drilling was performed.
+
+    Returns:
+    DataFrame: DataFrame with an additional column for WOB difference.
+    """
+    filtered_data = filtered_data.copy()  # Make a copy to avoid changing the original data
+    filtered_data['WOB Difference (klbs)'] = (filtered_data['Weight on Bit (klbs)'] - filtered_data['AutoDriller WOB SP (klbs)']).abs()
+    return filtered_data
+
+def calculate_rop_set_point(filtered_data):
+    """
+    Calculates the ROP Set Point for each colored point based on the average ROP value of the last 30 seconds.
+
+    Parameter:
+    filtered_data (DataFrame): Pandas DataFrame containing the periods when drilling was performed.
+
+    Returns:
+    DataFrame: DataFrame with an additional column for ROP Set Point.
+    """
+    filtered_data = filtered_data.copy()  # Make a copy to avoid changing the original data
+    filtered_data['ROP Set Point'] = np.nan  # Create an empty column for ROP Set Point
+
+    # Use rolling window to calculate the average ROP for the last 30 seconds
+    filtered_data['ROP Set Point'] = (
+        filtered_data['Rate Of Penetration (ft_per_hr)']
+        .rolling(window=30, min_periods=1, closed='both')
+        .mean()
+    )
+    
+    # Assign ROP Set Point only for rows with color detected
+    filtered_data.loc[~filtered_data['ROP Derivative Color'].isin(['Red', 'Orange', 'Yellow', 'Green']), 'ROP Set Point'] = np.nan
+    
+    return filtered_data
+
+# Example usage
+edr_data = pd.read_csv('filtered_selected_columns.csv')  # Load EDR data
+edr_data = create_datetime_and_time_sec_column(edr_data)  # Create DateTime and Time (sec) columns
+filtered_data = identify_drilling_periods(edr_data)  # Identify drilling periods
+filtered_data = calculate_wob_difference(filtered_data)  # Calculate WOB difference for drilling periods
+filtered_data = calculate_rop_derivative(filtered_data)  # Calculate ROP derivatives
+filtered_data = calculate_rop_set_point(filtered_data)  # Calculate ROP Set Point
+color_summary = generate_color_summary_table(filtered_data)  # Generate color summary table
+
+# Use of Hole Depth filter
+hole_depth_filtered_data = color_summary[(color_summary['Hole Depth (feet)'] >= 4000) & (color_summary['Hole Depth (feet)'] <= 6000)].reset_index(drop=True)  # Filter based on specific Hole Depth range
+
+print(hole_depth_filtered_data)
+
+# Generate plot to visualize colors
+color_order = ['Red', 'Orange', 'Yellow', 'Green']
+color_map = {'Red': 'r', 'Orange': 'orange', 'Yellow': 'y', 'Green': 'g'}
+
+plt.figure(figsize=(10, 6))
+for color in color_order:
+    data_subset = hole_depth_filtered_data[hole_depth_filtered_data['ROP Derivative Color'] == color]
+    plt.scatter(data_subset['Hole Depth (feet)'], [color] * len(data_subset), color=color_map[color], label=color)
+
+plt.xlabel('Hole Depth (feet)')
+plt.ylabel('ROP Derivative Color')
+plt.title('ROP Derivative Color Over Hole Depth')
+plt.legend()
+plt.gca().invert_yaxis()  # Reverse the y-axis to display colors from red to green from top to bottom
+plt.show()
