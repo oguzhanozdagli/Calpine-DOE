@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QFrame, QMessageBox, QPushButton, QGridLayout
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QFrame, QMessageBox, QPushButton, QGridLayout, QTextEdit, QDialog
 from PyQt5.QtCore import QTimer, Qt
 from matplotlib.dates import DateFormatter
 from datetime import timedelta
@@ -101,6 +101,44 @@ class FractureDetectionApp(QMainWindow):
         self.toggle_button = QPushButton("Toggle Time View")
         self.toggle_button.clicked.connect(self.toggle_time_view)
         main_layout.addWidget(self.toggle_button, 2, 0, 1, 5)
+
+        # Create a new button for "Frac Points"
+        self.frac_button = QPushButton("Frac Points")
+        self.frac_button.clicked.connect(self.handle_frac_points)  # Button click handler
+        main_layout.addWidget(self.frac_button, 3, 0, 1, 5)  # Position it below the toggle button
+
+    def handle_frac_points(self):
+        """Handle the Frac Points button click."""
+        # Create a new dialog window to show the fracture points information
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Fracture Points Information")
+        dialog.setMinimumSize(400, 300)
+
+        # Create a layout for the dialog
+        layout = QVBoxLayout()
+        dialog.setLayout(layout)
+
+        # Filter the data to get points with Yellow, Orange, or Red ROP Derivative Color
+        frac_points = self.data[self.data['ROP Derivative Color'].isin(['Yellow', 'Orange', 'Red'])]
+
+        # Extract relevant information
+        info_text = ""
+        for _, row in frac_points.iterrows():
+            info_text += (f"Time: {row['DateTime'].strftime('%H:%M:%S')}, "
+                          f"Depth: {row['Hole Depth (feet)']:.2f} ft, "
+                          f"ROP Derivative: {row['ROP Derivative']:.2f}, "
+                          f"Color: {row['ROP Derivative Color']}\n")
+
+        # Create a text area to display fracture points information
+        frac_points_info = QTextEdit()
+        frac_points_info.setReadOnly(True)
+        frac_points_info.setText(info_text)
+
+        # Add the text area to the dialog layout
+        layout.addWidget(frac_points_info)
+
+        # Show the dialog
+        dialog.exec_()
 
     def convert_time_to_seconds(self, df):
         """Convert HH:MM:SS to seconds and then format it as DateTime."""
