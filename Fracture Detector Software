@@ -1,0 +1,475 @@
+import sys
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QFrame, QMessageBox, QPushButton, QGridLayout, QTextEdit, QDialog, QLCDNumber
+from PyQt5.QtCore import QTimer, Qt, QRect
+from PyQt5 import QtGui
+from matplotlib.dates import DateFormatter
+from datetime import timedelta
+
+
+def calculate_rop_set_point(filtered_data):
+    """Calculate ROP Set Point using a rolling average."""
+    # Use rolling window to calculate the average ROP for the last 30 seconds
+    rop_sp = filtered_data['Rate Of Penetration (ft_per_hr)'].rolling(window=30, min_periods=1, closed='both').mean()
+    return rop_sp
+
+class FractureDetectionApp(QMainWindow):
+    def __init__(self, edr_data):
+        super().__init__()
+
+        # Filter the data for specific DateTime range
+        self.data = self.filter_data_by_datetime(edr_data)
+
+        # Process the data for fracture detection categories
+        self.data = self.calculate_rop_derivative(self.data)
+
+        # Apply ramp technique to Block Velocity and calculate its derivative
+        self.data = self.apply_ramp_technique(self.data, 'AutoDriller Block Velocity (ft_per_hr)')
+
+        # Initialize PyQt window
+        self.initUI()
+
+        # Timer for real-time data simulation
+        self.timer = QTimer()
+        self.timer.setInterval(1000)  # 1 second interval
+        self.timer.timeout.connect(self.update_box)
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.timeout.connect(self.update_date_label)
+        self.timer.start()
+
+        # Current index to simulate real-time data feed
+        self.current_index = 0
+        self.red_alert_start_time = None  # To track red alert durations
+
+        # Time range options for the graph view
+        self.time_range = None  # None means entire time view
+        self.time_ranges = [None, timedelta(minutes=5), timedelta(minutes=10), timedelta(minutes=30)]
+
+    def initUI(self):
+        """Initialize the GUI layout and components."""
+        self.setWindowTitle("Real-time Fracture Detection")
+
+        # Create a main widget to hold everything
+        main_widget = QWidget(self)
+        self.setCentralWidget(main_widget)
+
+        # Create a grid layout for better responsiveness
+        main_layout = QGridLayout()
+        main_widget.setLayout(main_layout)
+
+        # Create a horizontal layout for graphs
+        graph_layout = QGridLayout()
+        main_layout.addLayout(graph_layout, 0, 0, 1, 6)
+
+        # Initialize matplotlib figures and canvases for each graph
+        self.figure, ((self.ax_rop, self.ax_rop_derivative, self.ax_wob, self.ax_rpm, self.ax_depth_time, self.ax_block_velocity)) = plt.subplots(nrows=1, ncols=6)
+        self.ax_rop_derivative.get_yaxis().set_ticklabels([])
+        self.ax_wob.get_yaxis().set_ticklabels([])
+        self.ax_rpm.get_yaxis().set_ticklabels([])
+        self.ax_depth_time.get_yaxis().set_ticklabels([])
+        self.ax_block_velocity.get_yaxis().set_ticklabels([])
+
+        # Set smaller fonts for graph titles and labels
+        plt.rcParams.update({'font.size': 14, 'lines.linewidth': 2, 'ytick.labelsize': 10})  # Decrease font size and line width
+        plt.rcParams.update({'font.size': 10, 'lines.linewidth': 3, 'ytick.labelsize': 6})  # Decrease font size and line width
+
+        # Create FigureCanvas for each graph
+        self.canvas = FigureCanvas(self.figure)
+
+        # Add the canvases to the graph layout
+        graph_layout.addWidget(self.canvas, 0, 0,1,6)
+        
+        self.text1 = QLabel("ROP Set Point ")
+        self.data1 = QLCDNumber()
+        self.data1.setDigitCount(4)
+        self.data1.setGeometry(QRect(140, 60, 191, 161))
+        
+        self.text2 = QLabel("ROP Derivative")
+        self.data2 = QLCDNumber()
+        self.data2.setDigitCount(4)
+        self.data2.setGeometry(QRect(140, 60, 191, 161))
+        
+        self.text3 = QLabel("Block Velocity Derivative")
+        self.data3 = QLCDNumber()
+        self.data3.setDigitCount(4)
+        self.data3.setGeometry(QRect(140, 60, 191, 161))
+        
+        self.text4 = QLabel("WOB")
+        self.data4 = QLCDNumber()
+        self.data4.setDigitCount(4)
+        self.data4.setGeometry(QRect(140, 60, 191, 161))
+        
+        font = QtGui.QFont()
+        font.setPointSize(10)
+        
+        self.data1.setFont(font)
+        self.data1.setSegmentStyle(QLCDNumber.Flat)
+        self.data1.setProperty("value", 0.0)
+        self.data1.setObjectName("rop_sp")
+        
+        self.data2.setFont(font)
+        self.data2.setSegmentStyle(QLCDNumber.Flat)
+        self.data2.setProperty("value", 0.0)
+        self.data2.setObjectName("rop_d")
+        
+        self.data3.setFont(font)
+        self.data3.setSegmentStyle(QLCDNumber.Flat)
+        self.data3.setProperty("value", 0.0)
+        self.data3.setObjectName("bvd")
+        
+        self.data4.setFont(font)
+        self.data4.setSegmentStyle(QLCDNumber.Flat)
+        self.data4.setProperty("value", 0.0)
+        self.data4.setObjectName("wob")
+        
+        data_layout = QVBoxLayout()
+        data_layout.addWidget(self.text1)
+        data_layout.addWidget(self.data1)
+        data_layout.addWidget(self.text2)
+        data_layout.addWidget(self.data2)
+        data_layout.addWidget(self.text3)
+        data_layout.addWidget(self.data3)
+        data_layout.addWidget(self.text4)
+        data_layout.addWidget(self.data4)
+        graph_layout.addLayout(data_layout, 0, 6, 1, 1)
+        
+        # Create the date label and add it to the left side of the first plot
+        self.date_label = QLabel(self)
+        self.date_label.setText(self.data['DateTime'].iloc[0].strftime('%B %d, %Y'))
+        self.date_label.setAlignment(Qt.AlignLeft)
+        self.date_label.setStyleSheet("font-size: 14px;")  # Set small font size for the date label
+        graph_layout.addWidget(self.date_label, 0, 0, alignment=Qt.AlignTop | Qt.AlignLeft)
+
+        # Create a strip for displaying derivative labels and colors
+        self.rop_strip = QLabel("ROP Derivative")
+        self.rop_strip.setAlignment(Qt.AlignCenter)
+        self.rop_strip.setStyleSheet("background-color: green; color: white; font-size: 14px; font-weight: bold; height: 15px;")
+        self.rop_strip.setFixedHeight(60)  # Reduced height
+
+        self.velocity_strip = QLabel("Block Velocity Derivative")
+        self.velocity_strip.setAlignment(Qt.AlignCenter)
+        self.velocity_strip.setStyleSheet("background-color: green; color: white; font-size: 14px; font-weight: bold; height: 15px;")
+        self.velocity_strip.setFixedHeight(60)  # Reduced height
+
+        # Add the strips to a horizontal layout
+        strip_layout = QHBoxLayout()
+        strip_layout.addWidget(self.rop_strip)
+        strip_layout.addWidget(self.velocity_strip)
+
+        main_layout.addLayout(strip_layout, 1, 0, 1, 6)
+
+        # Create a button to toggle between different time views
+        self.toggle_button = QPushButton("Toggle Time View")
+        self.toggle_button.clicked.connect(self.toggle_time_view)
+        main_layout.addWidget(self.toggle_button, 2, 0, 1, 6)
+
+        # Create a new button for "Frac Points"
+        self.frac_button = QPushButton("Frac Points")
+        self.frac_button.clicked.connect(self.handle_frac_points)  # Button click handler
+        main_layout.addWidget(self.frac_button, 3, 0, 1, 6)  # Position it below the toggle button
+        
+        
+
+    def handle_frac_points(self):
+        """Handle the Frac Points button click."""
+        # Create a new dialog window to show the fracture points information
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Fracture Points Information")
+        dialog.setMinimumSize(400, 300)
+
+        # Create a layout for the dialog
+        layout = QVBoxLayout()
+        dialog.setLayout(layout)
+
+        # Filter the data to get points with Yellow, Orange, or Red ROP Derivative Color
+        frac_points = self.data[self.data['ROP Derivative Color'].isin(['Yellow', 'Orange', 'Red'])]
+
+        # Extract relevant information
+        info_text = ""
+        for _, row in frac_points.iterrows():
+            info_text += (f"Time: {row['DateTime'].strftime('%H:%M:%S')}, "
+                          f"Depth: {row['Hole Depth (feet)']:.2f} ft, "
+                          f"ROP Derivative: {row['ROP Derivative']:.2f}, "
+                          f"Color: {row['ROP Derivative Color']}\n")
+
+        # Create a text area to display fracture points information
+        frac_points_info = QTextEdit()
+        frac_points_info.setReadOnly(True)
+        frac_points_info.setText(info_text)
+
+        # Add the text area to the dialog layout
+        layout.addWidget(frac_points_info)
+
+        # Show the dialog
+        dialog.exec_()
+
+    def filter_data_by_datetime(self, df):
+        """Filter the data based on a specific DateTime range."""
+        start_time = pd.to_datetime("2023-12-16 05:16:30")
+        end_time = pd.to_datetime("2023-12-16 05:20:00")
+        df['DateTime'] = pd.to_datetime(df['YYYY/MM/DD'] + ' ' + df['HH:MM:SS'])
+        return df[(df['DateTime'] >= start_time) & (df['DateTime'] <= end_time)].reset_index(drop=True)
+
+    def calculate_rop_derivative(self, filtered_data):
+        """Calculates ROP derivatives using np.gradient and assigns color categories based on thresholds."""
+        red, orange, yellow = 4, 3.5, 3
+
+        filtered_data = filtered_data.copy()  # Make a copy to avoid changing the original data
+        filtered_data['ROP Derivative'] = np.nan  # Create an empty column
+
+        # Calculate ROP derivative using np.gradient for each group
+        rop_values = filtered_data['Rate Of Penetration (ft_per_hr)'].values
+        time_values = filtered_data['DateTime'].view('int64') // 10**9  # Convert to seconds
+        if len(rop_values) > 1:
+            rop_derivative = np.gradient(rop_values, time_values)
+            filtered_data['ROP Derivative'] = rop_derivative
+
+        # Determine color categories based on thresholds
+        conditions = [
+            (filtered_data['ROP Derivative'] > red),
+            (filtered_data['ROP Derivative'] > orange) & (filtered_data['ROP Derivative'] <= red),
+            (filtered_data['ROP Derivative'] > yellow) & (filtered_data['ROP Derivative'] <= orange)
+        ]
+        colors = ['Red', 'Orange', 'Yellow']  # Matching the number of conditions
+
+        # Assign colors based on conditions
+        filtered_data['ROP Derivative Color'] = np.select(conditions, colors, default='Green')
+
+        return filtered_data
+
+    def apply_ramp_technique(self, filtered_data, column_name='AutoDriller Block Velocity (ft_per_hr)'):
+        """
+        Applies ramp technique to reduce signal distortion at the beginning and end of drilling periods.
+        
+        Parameters:
+        filtered_data (DataFrame): The filtered DataFrame containing drilling data.
+        column_name (str): The name of the column to which the ramp technique will be applied.
+        
+        Returns:
+        DataFrame: The DataFrame with an additional column containing the ramp-corrected signal.
+        """
+        filtered_data = filtered_data.copy()
+
+        # Extract the signal
+        signal = filtered_data[column_name].values
+
+        # (1) Create the ramp
+        ramp = np.linspace(signal[0], signal[-1], len(signal))
+        
+        # (2) Subtract ramp
+        signal_no_ramp = signal - ramp
+
+        # (3) Apply FFT
+        fft_signal = np.fft.fft(signal_no_ramp)
+        frequencies = np.fft.fftfreq(len(signal), d=1)  # Adjust d based on sampling interval
+        
+        # (4) Filter frequencies (adjust threshold as needed)
+        threshold = 0.022  # Example threshold, modify as per requirement
+        fft_signal[np.abs(frequencies) > threshold] = 0
+
+        # (5) Apply IFFT
+        filtered_signal_no_ramp = np.real(np.fft.ifft(fft_signal))
+        
+        # (6) Add ramp back
+        filtered_signal_with_ramp = filtered_signal_no_ramp + ramp
+
+        # Add the result to the DataFrame
+        filtered_data[f'Ramp Corrected {column_name}'] = filtered_signal_with_ramp
+
+        # Calculate derivative of ramp-corrected signal
+        filtered_data[f'{column_name} Derivative'] = np.gradient(filtered_data[f'Ramp Corrected {column_name}'].values, filtered_data['DateTime'].view('int64') // 10**9)
+
+        return filtered_data
+
+    def update_box(self):
+        if self.current_index >= len(self.data):
+            self.timer.stop()
+            return
+        latest_data = self.data.iloc[:self.current_index]
+        if self.current_index == 0:
+            return
+        self.data1.display(calculate_rop_set_point(latest_data).values[-1])
+        self.data2.display(latest_data['ROP Derivative'].values[-1])
+        self.data3.display(latest_data['AutoDriller Block Velocity (ft_per_hr) Derivative'].values[-1])
+        self.data4.display(latest_data['Weight on Bit (klbs)'].values[-1])
+        
+        
+    def update_date_label(self):
+        if self.current_index < len(self.data):
+            current_date = self.data['DateTime'].iloc[self.current_index].strftime('%B %d, %Y')
+            self.date_label.setText(current_date)
+
+    def update_plot(self):
+        """Update the plot with real-time data."""
+        red, orange, yellow = 4, 3.5, 3
+
+        if self.current_index >= len(self.data):
+            self.timer.stop()
+            return
+
+        # Get the current slice of data up to current_index
+        latest_data = self.data.iloc[:self.current_index]
+
+        # Apply time filtering for last 5, 10, or 30 minutes view
+        if self.time_range:
+            min_time = latest_data['DateTime'].max() - self.time_range
+            latest_data = latest_data[latest_data['DateTime'] >= min_time]
+
+        # Clear previous plots
+        self.ax_rop.clear()
+        self.ax_rop_derivative.clear()
+        self.ax_wob.clear()
+        self.ax_rpm.clear()
+        self.ax_depth_time.clear()
+        self.ax_block_velocity.clear()
+
+        # Plot ROP (Rate of Penetration) vs Time
+        self.ax_rop.plot(latest_data['Rate Of Penetration (ft_per_hr)'], latest_data['DateTime'], color='blue')
+        self.ax_rop.set_xlabel('Rate of Penetration (ft/hr)')
+        self.ax_rop.set_ylabel('Time')
+        self.ax_rop.set_title('ROP vs Time')
+        self.ax_rop.invert_yaxis()  # Most recent data at the bottom
+
+        # Plot ROP Derivative vs Time with vertical threshold lines
+        self.ax_rop_derivative.plot(latest_data['ROP Derivative'], latest_data['DateTime'], color='green')
+        self.ax_rop_derivative.axvline(x=red, color='red', linestyle='--', label='Red Threshold')
+        self.ax_rop_derivative.axvline(x=orange, color='orange', linestyle='--', label='Orange Threshold')
+        self.ax_rop_derivative.axvline(x=yellow, color='yellow', linestyle='--', label='Yellow Threshold')
+        self.ax_rop_derivative.set_xlabel('ROP Derivative')
+        self.ax_rop_derivative.set_title('ROP Derivative vs Time')
+        self.ax_rop_derivative.invert_yaxis()  # Most recent data at the bottom
+
+        # Plot Weight on Bit (klbs) vs Time
+        self.ax_wob.plot(latest_data['Weight on Bit (klbs)'], latest_data['DateTime'], color='purple')
+        self.ax_wob.set_xlabel('WOB (klbs)')
+        self.ax_wob.set_title('Weight on Bit vs Time')
+        self.ax_wob.invert_yaxis()  # Most recent data at the bottom
+
+        # Plot Rotary RPM vs Time
+        self.ax_rpm.plot(latest_data['Rotary RPM (RPM)'], latest_data['DateTime'], color='orange')
+        self.ax_rpm.set_xlabel('RPM')
+        self.ax_rpm.set_title('Rotary RPM vs Time')
+        self.ax_rpm.invert_yaxis()  # Most recent data at the bottom
+
+        # Plot Hole Depth (feet) vs Time
+        self.ax_depth_time.plot(latest_data['Hole Depth (feet)'], latest_data['DateTime'], color='brown')
+        self.ax_depth_time.set_xlabel('Hole Depth (feet)')
+        self.ax_depth_time.set_title('Hole Depth vs Time')
+        self.ax_depth_time.invert_yaxis()  # Most recent data at the bottom
+
+        # Plot Block Velocity Derivative vs Time with vertical threshold lines
+        self.ax_block_velocity.plot(latest_data['AutoDriller Block Velocity (ft_per_hr) Derivative'], latest_data['DateTime'], color='cyan')
+        self.ax_block_velocity.axvline(x=red, color='red', linestyle='--', label='Red Threshold')
+        self.ax_block_velocity.axvline(x=orange, color='orange', linestyle='--', label='Orange Threshold')
+        self.ax_block_velocity.axvline(x=yellow, color='yellow', linestyle='--', label='Yellow Threshold')
+        self.ax_block_velocity.set_xlabel('Block Velocity Derivative')
+        self.ax_block_velocity.set_title('Block Velocity Derivative vs Time')
+        self.ax_block_velocity.invert_yaxis()  # Most recent data at the bottom
+
+        # Format time axis as DateTime on all graphs
+        date_format = DateFormatter("%H:%M:%S")
+        self.ax_rop.yaxis.set_major_formatter(date_format)
+        self.ax_rop_derivative.yaxis.set_major_formatter(date_format)
+        self.ax_wob.yaxis.set_major_formatter(date_format)
+        self.ax_rpm.yaxis.set_major_formatter(date_format)
+        self.ax_depth_time.yaxis.set_major_formatter(date_format)
+        self.ax_block_velocity.yaxis.set_major_formatter(date_format)
+        
+        # remove tick labels for plots 2-5
+        self.ax_rop_derivative.get_yaxis().set_ticklabels([])
+        self.ax_wob.get_yaxis().set_ticklabels([])
+        self.ax_rpm.get_yaxis().set_ticklabels([])
+        self.ax_depth_time.get_yaxis().set_ticklabels([])
+        self.ax_block_velocity.get_yaxis().set_ticklabels([])
+        
+        # Enable grids
+        self.ax_rop.grid(True)
+        self.ax_rop_derivative.grid(True)
+        self.ax_wob.grid(True)
+        self.ax_rpm.grid(True)
+        self.ax_depth_time.grid(True)
+        self.ax_block_velocity.grid(True)
+        plt.tight_layout()
+        
+        # Redraw the canvases to show the updated plots
+        self.canvas.draw()
+        
+
+        # Check for "Red" alerts (Fracture Detected)
+        if not latest_data.empty:
+            current_color_rop = latest_data['ROP Derivative Color'].iloc[-1]  # Get the last detected ROP color
+            self.update_strip_color(self.rop_strip, current_color_rop)
+
+            velocity_value = latest_data['AutoDriller Block Velocity (ft_per_hr) Derivative'].iloc[-1]
+            velocity_color = self.get_velocity_color(velocity_value)
+            self.update_strip_color(self.velocity_strip, velocity_color)
+
+            # Handle red alert pop-up if condition is met for more than 2 seconds
+            if current_color_rop == 'Red':
+                if self.red_alert_start_time is None:
+                    self.red_alert_start_time = latest_data['DateTime'].iloc[-1]
+#                 elif (latest_data['DateTime'].iloc[-1] - self.red_alert_start_time).total_seconds() > 2:
+#                     self.trigger_red_alert(latest_data['ROP Derivative'].iloc[-1], 2)
+            else:
+                self.red_alert_start_time = None
+
+        # Increment the index for the next update
+        self.current_index += 1
+
+    def update_strip_color(self, strip, color):
+        """Update the color of the strip label."""
+        color_map = {
+            'Green': 'green',
+            'Yellow': 'yellow',
+            'Orange': 'orange',
+            'Red': 'red'
+        }
+        text_color = 'white' if color in ['Red', 'Orange', 'Green'] else 'black'
+        strip.setStyleSheet(f"background-color: {color_map[color]}; color: {text_color}; font-size: 14px; font-weight: bold; height: 15px;")
+
+    def get_velocity_color(self, derivative_value):
+        """Determine color for velocity derivative based on thresholds."""
+        if derivative_value > 4:
+            return 'Red'
+        elif derivative_value > 3.5:
+            return 'Orange'
+        elif derivative_value > 3:
+            return 'Yellow'
+        else:
+            return 'Green'
+
+    def trigger_red_alert(self, rop_value, duration):
+        """Trigger a pop-up alert for a red alert."""
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("Fracture Detected")
+        msg.setText(f"ROP DERIVATIVE > {rop_value:.2f} for {duration} seconds.\nDrilling with ROP recommended due to fractures.")
+        msg.exec_()
+
+    def toggle_time_view(self):
+        """Toggle between the entire time view and the selected time views."""
+        # Cycle through the available time ranges (None for all, 5, 10, 30 min)
+        current_idx = self.time_ranges.index(self.time_range)
+        self.time_range = self.time_ranges[(current_idx + 1) % len(self.time_ranges)]
+
+
+# Main application entry point
+def main():
+    # Load real CSV data from file path
+    file_path = r"C:\Users\oguzhanozdagli\Calpine - Fracture Detector\GDC-36.csv"
+    edr_data = pd.read_csv(file_path)
+
+    # Create the application and main window
+    app = QApplication(sys.argv)
+    window = FractureDetectionApp(edr_data)
+    window.show()
+
+    # Execute the application
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()
